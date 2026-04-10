@@ -2,6 +2,7 @@
 // date: 07.02.2026
 
 // Aim: collect current power consumption from Tasmota32 
+// board ESP32 Dev Module
 // Basics
 //   - information collected over RESTAPI fetchData()
 //   - information reported on screen 
@@ -63,13 +64,14 @@ TFT_eSPI tft = TFT_eSPI();
 float dataPoints[MAX_POINTS];
 uint16_t pixel_x, pixel_y;
 float currentP = 0;
+float currentWater = -1.0;
+float totalP = -1.0;
 int subSampleCount = 0;
 unsigned long lastIstFetch = 0;
 unsigned long lastWebTransfer = 0;
 
 void setup() {
   uint16_t calibrationData[5];  
-  // static values to be replaced by recalibration algorithm
   calibrationData[0] = 478;
   calibrationData[1] = 3388;
   calibrationData[2] = 438;
@@ -99,7 +101,6 @@ void setup() {
   tft.println("zum kalibrieren");
   tft.setCursor(40, 180, 2);
   tft.println("beruehren");
-  // activate the following line to allow manual calibration
   // tft.calibrateTouch(calibrationData, TFT_GREEN, TFT_RED, 15);
   Serial.printf("calibration 0: %u\n", calibrationData[0]);
   Serial.printf("calibration 1: %u\n", calibrationData[1]);
@@ -127,7 +128,7 @@ void setup() {
   tft.setCursor(100, 90);
   tft.setTextColor(TFT_RED);
   tft.setTextSize(2);
-  tft.print("07.02.26");
+  tft.print("15.03.26");
   //Set last line
   tft.setTextColor(TFT_WHITE);
   tft.setCursor(60, 130);
@@ -173,7 +174,6 @@ void setup() {
 
 }
 
-
 void loop() {
   unsigned long now = millis();
   struct tm timeinfo;
@@ -187,13 +187,17 @@ void loop() {
     fetchData(); 
     subSampleCount++;
 
+    currentWater = getWaterValue();
+    Serial.print("Water value: ");
+    Serial.println(currentWater);
+
     // 2. Alle 3 Minuten (nach 6 Samples) Graph aktualisieren
     if (subSampleCount >= GRAPH_UPDATE_COUNT) {
+      saveToCSV(currentP);
       updateGraphArray(currentP);
       subSampleCount = 0;
     }
     
-    saveToCSV(currentP);
     drawUI(); 
     lastIstFetch = now;
 
@@ -227,27 +231,75 @@ void fetchData() {
   struct tm timeinfo;
   HTTPClient http;
   http.begin(serverUrl);
-  int httpCode = http.GET();
-
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (!error) {
-      // Accessing the nested JSON path: StatusSNS -> MT175 -> P
-      currentP = doc["StatusSNS"]["MT175"]["P"];      
-      Serial.printf("Current Power: %.2f W\n", currentP);
-      if(getLocalTime(&timeinfo))
-      {
-        strftime(strLastReport, sizeof(strSystemStart), "%d.%m - %H:%M:%S", &timeinfo);
-        Serial.println(strLastReport);
-      }
-    } 
-    else esp_restart();
+  const int maxRetries = 5;
+  int attempt = 0;
+  int httpCode = -1;
+  // Retry loop
+  while (attempt < maxRetries) {
+    httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      break;  // Success
+    }
+    Serial.printf("HTTP GET failed (code: %d), retry %d/%d\n", httpCode, attempt + 1, maxRetries);
+    attempt++;
+    delay(500); // small delay before retrying
   }
-  else esp_restart();
+  // If still not OK after retries → restart
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.println("Max retries reached. Restarting ESP...");
+    esp_restart();
+  }
+  // Process response
+  String payload = http.getString();
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (!error) {
+    currentP = doc["StatusSNS"]["MT175"]["P"];
+    totalP = doc["StatusSNS"]["MT175"]["E_in"];
+    Serial.printf("Current Power: %.2f W\n", currentP);
+    if (getLocalTime(&timeinfo)) {
+      strftime(strLastReport, sizeof(strSystemStart), "%d.%m - %H:%M:%S", &timeinfo);
+      Serial.println(strLastReport);
+    }
+  } else {
+    Serial.println("JSON parse error. Restarting ESP...");
+    esp_restart();
+  }
   http.end();
+}
+
+
+float getWaterValue() {
+    HTTPClient http;
+    WiFiClient client;
+
+    const char* url = "http://192.168.2.124/sensor/water";
+
+    http.begin(client, url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        http.end();
+
+        // Prepare JSON buffer
+        StaticJsonDocument<256> doc;
+
+        DeserializationError error = deserializeJson(doc, payload);
+        if (error) {
+            Serial.print("JSON parse failed: ");
+            Serial.println(error.c_str());
+            return -1.0;
+        }
+
+        // Extract the float value
+        float waterValue = doc["value"].as<float>();
+        return waterValue;
+
+    } else {
+        http.end();
+        return -1.0;  // error indicator
+    }
 }
 
 void updateGraphArray(float val) {
@@ -305,9 +357,14 @@ void drawUI() {
   }
   
   tft.drawNumber((int)maxVal, 10, 25); // Show max scale
-  tft.drawString("W (max)", 50, 25);
+  tft.drawString("W (max)", 63, 25);
   tft.drawNumber(currentP, 10, 45); // Show Last
-  tft.drawString("W (ist)", 50, 45);
+  tft.drawString("W (ist)", 63, 45);
+  tft.drawNumber(totalP*10, 10, 65); 
+  tft.drawString("kWh/10 (total)", 63, 65);
+  tft.drawNumber(currentWater*1000, 10, 85); 
+  tft.drawString("liter (ist)", 63, 85);
+
 }
 
 /*
